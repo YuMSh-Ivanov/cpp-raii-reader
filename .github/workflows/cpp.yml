@@ -1,0 +1,99 @@
+name: C++ CI
+
+on:
+  pull_request
+
+jobs:
+  formatting-check:
+    name: Formatting check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Check line breaks
+        run: |
+          sudo apt-get install -y dos2unix
+          pushd $GITHUB_WORKSPACE
+          bash ci-extra/check-lines.sh
+          popd
+      - name: Run clang-format style check
+        uses: jidicula/clang-format-action@v4.11.0
+        with:
+          clang-format-version: '18'
+          check-path: 'src'
+
+  test:
+    needs: formatting-check
+    name: "Test (${{ matrix.toolchain.name }}, ${{ matrix.build_type }})"
+
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - { name: Linux/GCC, os_name: linux, os: ubuntu-latest, compiler: gcc-14 }
+          - { name: Linux/Clang, os_name: linux, os: ubuntu-latest, compiler: clang-19 }
+          - { name: Windows, os_name: windows, os: windows-latest, compiler: msvc-2022 }
+        build_type:
+          - release
+          - relwithdebinfo
+          - debug
+          - sanitized-relwithdebinfo
+          - sanitized-debug
+        exclude:
+          # it's just unused without valgrind
+          - toolchain: { name: Windows }
+            build_type: RelWithDebInfo
+
+    runs-on: ${{ matrix.toolchain.os }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Cpp
+        if: ${{ !contains(matrix.toolchain.os, 'ubuntu') }}
+        uses: aminya/setup-cpp@v1
+        with:
+          compiler: ${{ matrix.toolchain.compiler }}
+          vcvarsall: true
+          ninja: true
+          cmake: true
+
+      - name: Install gdb
+        if: ${{ matrix.build_type == 'debug' && contains(matrix.toolchain.os, 'ubuntu') }}
+        run: |
+          sudo apt install gdb
+
+      - name: Install valgrind
+        if: ${{ matrix.build_type == 'relwithdebinfo' && contains(matrix.toolchain.os, 'ubuntu') }}
+        run: |
+          sudo apt install valgrind
+
+      - name: Configure
+        run: |
+          cmake -S . -B cmake-build-"${{ matrix.build_type }}" --preset "${{ matrix.toolchain.os_name }}-${{ matrix.build_type }}" -G Ninja -DTREAT_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: |
+          cmake --build cmake-build-"${{ matrix.build_type }}" -j
+
+      - name: Run tests with debugger
+        if: ${{ matrix.build_type == 'debug' && contains(matrix.toolchain.os, 'ubuntu') }}
+        run: |
+          gdb -q -return-child-result --batch -ex 'handle SIGHUP nostop pass' -ex 'handle SIGQUIT nostop pass' -ex 'handle SIGPIPE nostop pass' -ex 'handle SIGALRM nostop pass' -ex 'handle SIGTERM nostop pass' -ex 'handle SIGUSR1 nostop pass' -ex 'handle SIGUSR2 nostop pass' -ex 'handle SIGCHLD nostop pass' -ex 'set style enabled on' -ex 'set print frame-arguments all' -ex 'run' -ex 'thread apply all bt -frame-info source-and-location -full' --args cmake-build-"${{ matrix.build_type }}"/tests
+
+      - name: Run tests
+        if: ${{ matrix.build_type != 'debug' || !contains(matrix.toolchain.os, 'ubuntu') }}
+        run: |
+          cmake-build-"${{ matrix.build_type }}"/tests
+
+      - name: Run tests with valgrind
+        if: ${{ matrix.build_type == 'relwithdebinfo' && contains(matrix.toolchain.os, 'ubuntu') }}
+        run: |
+          valgrind --tool=memcheck --gen-suppressions=all --leak-check=full --show-leak-kinds=all --leak-resolution=med --track-origins=yes --vgdb=no --error-exitcode=1 cmake-build-"${{ matrix.build_type }}"/tests
